@@ -120,7 +120,7 @@ def _(MinigridFeaturesExtractor):
         max_grad_norm=0.5,
         seed=0,
         device="cpu",
-        verbose=0,
+        verbose=1,
     )
     return (BASE_PPO,)
 
@@ -385,10 +385,11 @@ def _(BaseCallback, PPO, evaluate_policy, json, np, os):
         dst.policy.load_state_dict(src.policy.state_dict())
         return dst
 
-    def train_with_curve(model, total_steps, eval_env_fn,
+    def train_with_curve(savedir,model, total_steps, eval_env_fn,
                          eval_freq=5000, n_eval_episodes=10):
         cb = LearningCurveCallback(eval_env_fn, eval_freq, n_eval_episodes)
         model.learn(total_steps, callback=cb, reset_num_timesteps=True)
+        model.save(savedir)
         return cb.curve
 
     def compute_aulc(curve):
@@ -399,7 +400,7 @@ def _(BaseCallback, PPO, evaluate_policy, json, np, os):
             return float(curve[0][1])
         steps = np.array([s for s, _ in curve], dtype=float)
         rewards = np.array([r for _, r in curve], dtype=float)
-        return float(np.trapz(rewards, steps) / (steps[-1] - steps[0]))
+        return float(np.trapezoid(rewards, steps) / (steps[-1] - steps[0]))
 
     def save_json(path, data):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -413,6 +414,7 @@ def _(BaseCallback, PPO, evaluate_policy, json, np, os):
     return (
         compute_aulc,
         freeze_encoder,
+        load_json,
         make_ppo,
         save_json,
         train_with_curve,
@@ -450,36 +452,19 @@ def _(mo):
 @app.cell
 def _(
     AffineTransform,
-    BASE_PPO,
     CyclicTranslation,
     GlobalColorShift,
     Monitor,
-    RESULTS_DIR,
     SpriteTextureSwap,
-    compute_aulc,
-    freeze_encoder,
     make_base_env,
-    make_ppo,
-    save_json,
-    train_with_curve,
-    transfer_all_policy,
-    transfer_encoder,
 ):
-    _SOURCE_STEPS = 100_000
-    _TARGET_STEPS = 50_000
-    _EVAL_FREQ    = 5_000
-    _N_EVAL_EPS   = 10
-
-    # ── Source training ───────────────────────────────────────────────────────
-    print("=== Exp 1: training source model ===")
-    _src_env = Monitor(make_base_env())
-    exp1_source = make_ppo(_src_env, BASE_PPO)
-    exp1_source.learn(_SOURCE_STEPS)
-    exp1_source.save(f"{RESULTS_DIR}/exp1/source_model")
-    print("Source model saved.")
+    SOURCE_STEPS = 100_000
+    TARGET_STEPS = 50_000
+    EVAL_FREQ    = 5_000
+    N_EVAL_EPS   = 10
 
     # ── Target env factories ──────────────────────────────────────────────────
-    _targets = {
+    targets = {
         "rot_30":      lambda: Monitor(AffineTransform(make_base_env(), angle=30)),
         "trans_x":     lambda: Monitor(CyclicTranslation(make_base_env(), shift_x=8)),
         "trans_y":     lambda: Monitor(CyclicTranslation(make_base_env(), shift_y=8)),
@@ -489,47 +474,101 @@ def _(
         "swap_agent":  lambda: Monitor(SpriteTextureSwap(make_base_env(), swap_agent=True)),
         "swap_floor":  lambda: Monitor(SpriteTextureSwap(make_base_env(), swap_floor=True)),
     }
+    return EVAL_FREQ, N_EVAL_EPS, SOURCE_STEPS, TARGET_STEPS, targets
 
-    exp1_curves = {}
-    exp1_aulc   = {}
 
-    for _tname, _tfn in _targets.items():
-        print(f"\n  target: {_tname}")
-        exp1_curves[_tname] = {}
+@app.cell
+def _(
+    BASE_PPO,
+    Monitor,
+    PPO,
+    RESULTS_DIR,
+    SOURCE_STEPS,
+    make_base_env,
+    make_ppo,
+    os,
+):
+    # ── Source training ───────────────────────────────────────────────────────
+    _src_path = f"{RESULTS_DIR}/exp1/source_model.zip"
+    if os.path.exists(_src_path):
+        print(f"=== Exp 1: loading existing source model from {_src_path} ===")
+        _src_env = Monitor(make_base_env())
+        exp1_source = PPO.load(_src_path, env=_src_env)
+    else:
+        print("=== Exp 1: training source model ===")
+        _src_env = Monitor(make_base_env())
+        exp1_source = make_ppo(_src_env, BASE_PPO)
+        exp1_source.learn(SOURCE_STEPS)
+        exp1_source.save(f"{RESULTS_DIR}/exp1/source_model")
+        print("Source model saved.")
+    return (exp1_source,)
 
-        # scratch
-        _m = make_ppo(_tfn(), BASE_PPO)
-        exp1_curves[_tname]["scratch"] = train_with_curve(
-            _m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
 
-        # frozen_transfer
-        _m = make_ppo(_tfn(), BASE_PPO)
-        transfer_encoder(exp1_source, _m)
-        freeze_encoder(_m)
-        exp1_curves[_tname]["frozen_transfer"] = train_with_curve(
-            _m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+@app.cell
+def _(
+    BASE_PPO,
+    EVAL_FREQ,
+    N_EVAL_EPS,
+    PPO,
+    RESULTS_DIR,
+    TARGET_STEPS,
+    compute_aulc,
+    exp1_source,
+    freeze_encoder,
+    load_json,
+    make_ppo,
+    os,
+    save_json,
+    targets,
+    train_with_curve,
+    transfer_all_policy,
+    transfer_encoder,
+):
 
-        # finetune (all weights from source, all params trainable)
-        _m = make_ppo(_tfn(), BASE_PPO)
-        transfer_all_policy(exp1_source, _m)
-        exp1_curves[_tname]["finetune"] = train_with_curve(
-            _m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+    # Check if all results are already saved
+    _curves_path = f"{RESULTS_DIR}/exp1/curves.json"
+    _aulc_path = f"{RESULTS_DIR}/exp1/aulc.json"
+    if os.path.exists(_curves_path) and os.path.exists(_aulc_path):
+        print("=== Exp 1: loading existing results ===")
+        exp1_curves = load_json(_curves_path)
+        exp1_aulc = load_json(_aulc_path)
+        print(f"  Loaded curves for targets: {list(exp1_curves.keys())}")
+    else:
+        exp1_curves = {}
+        exp1_aulc   = {}
 
-        # random_frozen
-        _m = make_ppo(_tfn(), BASE_PPO)
-        freeze_encoder(_m)
-        exp1_curves[_tname]["random_frozen"] = train_with_curve(
-            _m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+        for _tname, _tfn in targets.items():
+            print(f"\n  target: {_tname}")
+            exp1_curves[_tname] = {}
 
-        exp1_aulc[_tname] = {
-            cond: compute_aulc(curve)
-            for cond, curve in exp1_curves[_tname].items()
-        }
-        print(f"    AULC: {exp1_aulc[_tname]}")
+            _modes = {
+                "scratch":         lambda: make_ppo(_tfn(), BASE_PPO),
+                "frozen_transfer": lambda: freeze_encoder(transfer_encoder(exp1_source, make_ppo(_tfn(), BASE_PPO))),
+                "finetune":        lambda: transfer_all_policy(exp1_source, make_ppo(_tfn(), BASE_PPO)),
+                "random_frozen":   lambda: freeze_encoder(make_ppo(_tfn(), BASE_PPO)),
+            }
 
-    save_json(f"{RESULTS_DIR}/exp1/curves.json", exp1_curves)
-    save_json(f"{RESULTS_DIR}/exp1/aulc.json", exp1_aulc)
-    print("\nExp 1 complete.")
+            for _mode, _make_model in _modes.items():
+                _savedir = f"{RESULTS_DIR}/exp1/{_tname}_{_mode}"
+                if os.path.exists(f"{_savedir}.zip"):
+                    print(f"    {_mode}: loading existing model from {_savedir}.zip")
+                    _m = PPO.load(_savedir, env=_tfn())
+                    exp1_curves[_tname][_mode] = []  # curve not available for loaded models
+                else:
+                    print(f"    {_mode}: training")
+                    _m = _make_model()
+                    exp1_curves[_tname][_mode] = train_with_curve(
+                        _savedir, _m, TARGET_STEPS, _tfn, EVAL_FREQ, N_EVAL_EPS)
+
+            exp1_aulc[_tname] = {
+                cond: compute_aulc(curve)
+                for cond, curve in exp1_curves[_tname].items()
+            }
+            print(f"    AULC: {exp1_aulc[_tname]}")
+
+        save_json(_curves_path, exp1_curves)
+        save_json(_aulc_path, exp1_aulc)
+        print("\nExp 1 complete.")
     return
 
 
@@ -554,123 +593,133 @@ def _(
     CyclicTranslation,
     GlobalColorShift,
     Monitor,
+    PPO,
     RESULTS_DIR,
     RandomAugWrapper,
     SpriteTextureSwap,
     c,
     compute_aulc,
     freeze_encoder,
+    load_json,
     make_base_env,
     make_ppo,
+    os,
     save_json,
     train_with_curve,
     transfer_encoder,
 ):
-    _SOURCE_STEPS = 100_000
-    _TARGET_STEPS = 50_000
-    _EVAL_FREQ    = 5_000
-    _N_EVAL_EPS   = 10
+    _results_path = f"{RESULTS_DIR}/exp2/results.json"
+    if os.path.exists(_results_path):
+        print("=== Exp 2: loading existing results ===")
+        exp2_results = load_json(_results_path)
+    else:
+        _SOURCE_STEPS = 100_000
+        _TARGET_STEPS = 50_000
+        _EVAL_FREQ    = 5_000
+        _N_EVAL_EPS   = 10
 
-    exp2_results = {}
+        exp2_results = {}
 
-    # ── Within-family: color ─────────────────────────────────────────────────
-    print("=== Exp 2: within-family (color) ===")
+        # ── Within-family: color ─────────────────────────────────────────────────
+        print("=== Exp 2: within-family (color) ===")
 
-    # Train with red + green color augmentation
-    def _make_wf_aug_env():
-        base = make_base_env()
-        return Monitor(RandomAugWrapper(base, [
-            lambda o: ((o.astype("int32") + [50, 0, 0]) % 256).astype("uint8"),
-            lambda o: ((o.astype("int32") + [0, 50, 0]) % 256).astype("uint8"),
-        ]))
+        def _make_wf_aug_env():
+            base = make_base_env()
+            return Monitor(RandomAugWrapper(base, [
+                lambda o: ((o.astype("int32") + [50, 0, 0]) % 256).astype("uint8"),
+                lambda o: ((o.astype("int32") + [0, 50, 0]) % 256).astype("uint8"),
+            ]))
 
-    _aug_env = _make_wf_aug_env()
-    _aug_model = make_ppo(_aug_env, BASE_PPO)
-    _aug_model.learn(_SOURCE_STEPS)
-    _aug_model.save(f"{RESULTS_DIR}/exp2/within_family_aug_model")
+        _wf_model_path = f"{RESULTS_DIR}/exp2/within_family_aug_model.zip"
+        if os.path.exists(_wf_model_path):
+            print("  Loading existing within-family aug model")
+            _aug_model = PPO.load(_wf_model_path, env=_make_wf_aug_env())
+        else:
+            _aug_env = _make_wf_aug_env()
+            _aug_model = make_ppo(_aug_env, BASE_PPO)
+            _aug_model.learn(_SOURCE_STEPS)
+            _aug_model.save(f"{RESULTS_DIR}/exp2/within_family_aug_model")
 
-    # Held-out test envs: blue shift and yellow shift
-    _wf_targets = {
-        "blue_shift":   lambda: Monitor(GlobalColorShift(make_base_env(), shift=(0, 0, 50))),
-        "yellow_shift": lambda: Monitor(GlobalColorShift(make_base_env(), shift=(50, 50, 0))),
-    }
-
-    exp2_results["within_family"] = {}
-    for _tname, _tfn in _wf_targets.items():
-        exp2_results["within_family"][_tname] = {}
-
-        # frozen aug encoder
-        _m = make_ppo(_tfn(), BASE_PPO)
-        transfer_encoder(_aug_model, _m)
-        freeze_encoder(_m)
-        exp2_results["within_family"][_tname]["frozen_aug"] = {
-            "curve": train_with_curve(_m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+        _wf_targets = {
+            "blue_shift":   lambda: Monitor(GlobalColorShift(make_base_env(), shift=(0, 0, 50))),
+            "yellow_shift": lambda: Monitor(GlobalColorShift(make_base_env(), shift=(50, 50, 0))),
         }
 
-        # scratch baseline
-        _m = make_ppo(_tfn(), BASE_PPO)
-        exp2_results["within_family"][_tname]["scratch"] = {
-            "curve": train_with_curve(_m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+        exp2_results["within_family"] = {}
+        for _tname, _tfn in _wf_targets.items():
+            exp2_results["within_family"][_tname] = {}
+
+            _m = make_ppo(_tfn(), BASE_PPO)
+            transfer_encoder(_aug_model, _m)
+            freeze_encoder(_m)
+            exp2_results["within_family"][_tname]["frozen_aug"] = {
+                "curve": train_with_curve(_m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+            }
+
+            _m = make_ppo(_tfn(), BASE_PPO)
+            exp2_results["within_family"][_tname]["scratch"] = {
+                "curve": train_with_curve(_m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+            }
+
+            for _cond in exp2_results["within_family"][_tname]:
+                exp2_results["within_family"][_tname][_cond]["aulc"] = compute_aulc(
+                    exp2_results["within_family"][_tname][_cond]["curve"]
+                )
+            print(f"  {_tname}: {{{c: v['aulc']:.2f} for c,v in exp2_results['within_family'][_tname].items()}}")
+
+        # ── Cross-family: color+sprite → rotation+translation ────────────────────
+        print("\n=== Exp 2: cross-family ===")
+
+        def _make_cf_aug_env():
+            base = make_base_env()
+            wrappers_fns = [
+                lambda o: ((o.astype("int32") + [50, 0, 0]) % 256).astype("uint8"),
+                lambda o: ((o.astype("int32") + [0, 50, 0]) % 256).astype("uint8"),
+            ]
+            return Monitor(RandomAugWrapper(
+                SpriteTextureSwap(base, swap_goal=True, swap_agent=True),
+                wrappers_fns,
+            ))
+
+        _cf_model_path = f"{RESULTS_DIR}/exp2/cross_family_aug_model.zip"
+        if os.path.exists(_cf_model_path):
+            print("  Loading existing cross-family aug model")
+            _cf_model = PPO.load(_cf_model_path, env=_make_cf_aug_env())
+        else:
+            _cf_env = _make_cf_aug_env()
+            _cf_model = make_ppo(_cf_env, BASE_PPO)
+            _cf_model.learn(_SOURCE_STEPS)
+            _cf_model.save(f"{RESULTS_DIR}/exp2/cross_family_aug_model")
+
+        _cf_targets = {
+            "rot_30":   lambda: Monitor(AffineTransform(make_base_env(), angle=30)),
+            "trans_x":  lambda: Monitor(CyclicTranslation(make_base_env(), shift_x=8)),
+            "trans_xy": lambda: Monitor(CyclicTranslation(make_base_env(), shift_x=8, shift_y=8)),
         }
 
-        for _cond in exp2_results["within_family"][_tname]:
-            exp2_results["within_family"][_tname][_cond]["aulc"] = compute_aulc(
-                exp2_results["within_family"][_tname][_cond]["curve"]
-            )
-        print(f"  {_tname}: {{{c: v['aulc']:.2f} for c,v in exp2_results['within_family'][_tname].items()}}")
+        exp2_results["cross_family"] = {}
+        for _tname, _tfn in _cf_targets.items():
+            exp2_results["cross_family"][_tname] = {}
 
-    # ── Cross-family: color+sprite → rotation+translation ────────────────────
-    print("\n=== Exp 2: cross-family ===")
+            _m = make_ppo(_tfn(), BASE_PPO)
+            transfer_encoder(_cf_model, _m)
+            freeze_encoder(_m)
+            exp2_results["cross_family"][_tname]["frozen_aug"] = {
+                "curve": train_with_curve(_m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+            }
 
-    def _make_cf_aug_env():
-        base = make_base_env()
-        wrappers_fns = [
-            lambda o: ((o.astype("int32") + [50, 0, 0]) % 256).astype("uint8"),
-            lambda o: ((o.astype("int32") + [0, 50, 0]) % 256).astype("uint8"),
-        ]
-        # Sprite swap functions require access to grid state so we wrap differently
-        # Use GlobalColorShift and SpriteTextureSwap as separate training runs,
-        # then combine via RandomAugWrapper on the observation array level (color only)
-        # and train on sprite env separately; here we use color-only aug for simplicity
-        return Monitor(RandomAugWrapper(
-            SpriteTextureSwap(base, swap_goal=True, swap_agent=True),
-            wrappers_fns,
-        ))
+            _m = make_ppo(_tfn(), BASE_PPO)
+            exp2_results["cross_family"][_tname]["scratch"] = {
+                "curve": train_with_curve(_m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
+            }
 
-    _cf_env = _make_cf_aug_env()
-    _cf_model = make_ppo(_cf_env, BASE_PPO)
-    _cf_model.learn(_SOURCE_STEPS)
-    _cf_model.save(f"{RESULTS_DIR}/exp2/cross_family_aug_model")
+            for _cond in exp2_results["cross_family"][_tname]:
+                exp2_results["cross_family"][_tname][_cond]["aulc"] = compute_aulc(
+                    exp2_results["cross_family"][_tname][_cond]["curve"]
+                )
 
-    _cf_targets = {
-        "rot_30":   lambda: Monitor(AffineTransform(make_base_env(), angle=30)),
-        "trans_x":  lambda: Monitor(CyclicTranslation(make_base_env(), shift_x=8)),
-        "trans_xy": lambda: Monitor(CyclicTranslation(make_base_env(), shift_x=8, shift_y=8)),
-    }
-
-    exp2_results["cross_family"] = {}
-    for _tname, _tfn in _cf_targets.items():
-        exp2_results["cross_family"][_tname] = {}
-
-        _m = make_ppo(_tfn(), BASE_PPO)
-        transfer_encoder(_cf_model, _m)
-        freeze_encoder(_m)
-        exp2_results["cross_family"][_tname]["frozen_aug"] = {
-            "curve": train_with_curve(_m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
-        }
-
-        _m = make_ppo(_tfn(), BASE_PPO)
-        exp2_results["cross_family"][_tname]["scratch"] = {
-            "curve": train_with_curve(_m, _TARGET_STEPS, _tfn, _EVAL_FREQ, _N_EVAL_EPS)
-        }
-
-        for _cond in exp2_results["cross_family"][_tname]:
-            exp2_results["cross_family"][_tname][_cond]["aulc"] = compute_aulc(
-                exp2_results["cross_family"][_tname][_cond]["curve"]
-            )
-
-    save_json(f"{RESULTS_DIR}/exp2/results.json", exp2_results)
-    print("Exp 2 complete.")
+        save_json(_results_path, exp2_results)
+        print("Exp 2 complete.")
     return
 
 
@@ -702,74 +751,83 @@ def _(
     SpriteTextureSwap,
     evaluate_policy,
     freeze_encoder,
+    load_json,
     make_base_env,
     make_ppo,
     np,
+    os,
     save_json,
 ):
-    _STEPS_PER_TASK = 100_000
-    _N_EVAL_EPS     = 20
+    _results_path = f"{RESULTS_DIR}/exp3/results.json"
+    _meta_path = f"{RESULTS_DIR}/exp3/meta.json"
+    if os.path.exists(_results_path) and os.path.exists(_meta_path):
+        print("=== Exp 3: loading existing results ===")
+        exp3_results = load_json(_results_path)
+        exp3_meta = load_json(_meta_path)
+    else:
+        _STEPS_PER_TASK = 100_000
+        _N_EVAL_EPS     = 20
 
-    _task_seq = [
-        ("baseline",     lambda: Monitor(make_base_env())),
-        ("color_shift",  lambda: Monitor(GlobalColorShift(make_base_env(), shift=(50, 50, 50)))),
-        ("sprite_swap",  lambda: Monitor(SpriteTextureSwap(make_base_env(), swap_goal=True, swap_agent=True))),
-        ("rotation",     lambda: Monitor(AffineTransform(make_base_env(), angle=30))),
-    ]
-    _n = len(_task_seq)
+        _task_seq = [
+            ("baseline",     lambda: Monitor(make_base_env())),
+            ("color_shift",  lambda: Monitor(GlobalColorShift(make_base_env(), shift=(50, 50, 50)))),
+            ("sprite_swap",  lambda: Monitor(SpriteTextureSwap(make_base_env(), swap_goal=True, swap_agent=True))),
+            ("rotation",     lambda: Monitor(AffineTransform(make_base_env(), angle=30))),
+        ]
+        _n = len(_task_seq)
 
-    def _run_condition(condition_name):
-        matrix = np.full((_n, _n), np.nan)
-        model = None
-        encoder_frozen = False
+        def _run_condition(condition_name):
+            matrix = np.full((_n, _n), np.nan)
+            model = None
+            encoder_frozen = False
 
-        for i, (tname, env_fn) in enumerate(_task_seq):
-            print(f"  [{condition_name}] task {i}: {tname}")
+            for i, (tname, env_fn) in enumerate(_task_seq):
+                print(f"  [{condition_name}] task {i}: {tname}")
 
-            if condition_name == "scratch":
-                train_env = env_fn()
-                model = make_ppo(train_env, BASE_PPO)
-                model.learn(_STEPS_PER_TASK, reset_num_timesteps=True)
-
-            elif condition_name == "plastic":
-                train_env = env_fn()
-                if model is None:
-                    model = make_ppo(train_env, BASE_PPO)
-                else:
-                    model.set_env(DummyVecEnv([env_fn]))
-                model.learn(_STEPS_PER_TASK, reset_num_timesteps=False)
-
-            elif condition_name == "frozen":
-                train_env = env_fn()
-                if model is None:
+                if condition_name == "scratch":
+                    train_env = env_fn()
                     model = make_ppo(train_env, BASE_PPO)
                     model.learn(_STEPS_PER_TASK, reset_num_timesteps=True)
-                else:
-                    if not encoder_frozen:
-                        freeze_encoder(model)
-                        encoder_frozen = True
-                    model.set_env(DummyVecEnv([env_fn]))
+
+                elif condition_name == "plastic":
+                    train_env = env_fn()
+                    if model is None:
+                        model = make_ppo(train_env, BASE_PPO)
+                    else:
+                        model.set_env(DummyVecEnv([env_fn]))
                     model.learn(_STEPS_PER_TASK, reset_num_timesteps=False)
 
-            # Evaluate on all tasks so far
-            for j, (ename, eval_fn) in enumerate(_task_seq):
-                eval_env = eval_fn()
-                mean_r, _ = evaluate_policy(
-                    model, eval_env, n_eval_episodes=_N_EVAL_EPS, deterministic=False)
-                matrix[i, j] = float(mean_r)
-                eval_env.close()
+                elif condition_name == "frozen":
+                    train_env = env_fn()
+                    if model is None:
+                        model = make_ppo(train_env, BASE_PPO)
+                        model.learn(_STEPS_PER_TASK, reset_num_timesteps=True)
+                    else:
+                        if not encoder_frozen:
+                            freeze_encoder(model)
+                            encoder_frozen = True
+                        model.set_env(DummyVecEnv([env_fn]))
+                        model.learn(_STEPS_PER_TASK, reset_num_timesteps=False)
 
-        return matrix.tolist()
+                # Evaluate on all tasks so far
+                for j, (ename, eval_fn) in enumerate(_task_seq):
+                    eval_env = eval_fn()
+                    mean_r, _ = evaluate_policy(
+                        model, eval_env, n_eval_episodes=_N_EVAL_EPS, deterministic=False)
+                    matrix[i, j] = float(mean_r)
+                    eval_env.close()
 
-    exp3_results = {}
-    for _cond in ("scratch", "plastic", "frozen"):
-        print(f"\n=== Exp 3: condition = {_cond} ===")
-        exp3_results[_cond] = _run_condition(_cond)
+            return matrix.tolist()
 
-    exp3_meta = {"task_names": [n for n, _ in _task_seq]}
-    save_json(f"{RESULTS_DIR}/exp3/results.json", exp3_results)
-    save_json(f"{RESULTS_DIR}/exp3/meta.json", exp3_meta)
-    print("\nExp 3 complete.")
+        exp3_results = {}
+        for _cond in ("scratch", "plastic", "frozen"):
+            print(f"\n=== Exp 3: condition = {_cond} ===")
+            exp3_results[_cond] = _run_condition(_cond)
+
+        exp3_meta = {"task_names": [n for n, _ in _task_seq]}
+        save_json(_results_path, exp3_results)
+        save_json(_meta_path, exp3_meta)
+        print("\nExp 3 complete.")
     return
 
 
@@ -795,73 +853,82 @@ def _(
     RESULTS_DIR,
     evaluate_policy,
     freeze_encoder,
+    load_json,
     make_goal_env,
     make_ppo,
     np,
+    os,
     save_json,
 ):
-    _STEPS_PER_TASK = 100_000
-    _N_EVAL_EPS     = 20
+    _results_path = f"{RESULTS_DIR}/exp4/results.json"
+    _meta_path = f"{RESULTS_DIR}/exp4/meta.json"
+    if os.path.exists(_results_path) and os.path.exists(_meta_path):
+        print("=== Exp 4: loading existing results ===")
+        exp4_results = load_json(_results_path)
+        exp4_meta = load_json(_meta_path)
+    else:
+        _STEPS_PER_TASK = 100_000
+        _N_EVAL_EPS     = 20
 
-    _task_seq4 = [
-        ("goal_33", lambda: Monitor(make_goal_env((3, 3)))),
-        ("goal_11", lambda: Monitor(make_goal_env((1, 1)))),
-        ("goal_31", lambda: Monitor(make_goal_env((3, 1)))),
-        ("goal_13", lambda: Monitor(make_goal_env((1, 3)))),
-    ]
-    _n4 = len(_task_seq4)
+        _task_seq4 = [
+            ("goal_33", lambda: Monitor(make_goal_env((3, 3)))),
+            ("goal_11", lambda: Monitor(make_goal_env((1, 1)))),
+            ("goal_31", lambda: Monitor(make_goal_env((3, 1)))),
+            ("goal_13", lambda: Monitor(make_goal_env((1, 3)))),
+        ]
+        _n4 = len(_task_seq4)
 
-    def _run_condition4(condition_name):
-        matrix = np.full((_n4, _n4), np.nan)
-        model = None
-        encoder_frozen = False
+        def _run_condition4(condition_name):
+            matrix = np.full((_n4, _n4), np.nan)
+            model = None
+            encoder_frozen = False
 
-        for i, (tname, env_fn) in enumerate(_task_seq4):
-            print(f"  [{condition_name}] task {i}: {tname}")
+            for i, (tname, env_fn) in enumerate(_task_seq4):
+                print(f"  [{condition_name}] task {i}: {tname}")
 
-            if condition_name == "scratch":
-                train_env = env_fn()
-                model = make_ppo(train_env, BASE_PPO)
-                model.learn(_STEPS_PER_TASK, reset_num_timesteps=True)
-
-            elif condition_name == "plastic":
-                train_env = env_fn()
-                if model is None:
-                    model = make_ppo(train_env, BASE_PPO)
-                else:
-                    model.set_env(DummyVecEnv([env_fn]))
-                model.learn(_STEPS_PER_TASK, reset_num_timesteps=False)
-
-            elif condition_name == "frozen":
-                train_env = env_fn()
-                if model is None:
+                if condition_name == "scratch":
+                    train_env = env_fn()
                     model = make_ppo(train_env, BASE_PPO)
                     model.learn(_STEPS_PER_TASK, reset_num_timesteps=True)
-                else:
-                    if not encoder_frozen:
-                        freeze_encoder(model)
-                        encoder_frozen = True
-                    model.set_env(DummyVecEnv([env_fn]))
+
+                elif condition_name == "plastic":
+                    train_env = env_fn()
+                    if model is None:
+                        model = make_ppo(train_env, BASE_PPO)
+                    else:
+                        model.set_env(DummyVecEnv([env_fn]))
                     model.learn(_STEPS_PER_TASK, reset_num_timesteps=False)
 
-            for j, (ename, eval_fn) in enumerate(_task_seq4):
-                eval_env = eval_fn()
-                mean_r, _ = evaluate_policy(
-                    model, eval_env, n_eval_episodes=_N_EVAL_EPS, deterministic=False)
-                matrix[i, j] = float(mean_r)
-                eval_env.close()
+                elif condition_name == "frozen":
+                    train_env = env_fn()
+                    if model is None:
+                        model = make_ppo(train_env, BASE_PPO)
+                        model.learn(_STEPS_PER_TASK, reset_num_timesteps=True)
+                    else:
+                        if not encoder_frozen:
+                            freeze_encoder(model)
+                            encoder_frozen = True
+                        model.set_env(DummyVecEnv([env_fn]))
+                        model.learn(_STEPS_PER_TASK, reset_num_timesteps=False)
 
-        return matrix.tolist()
+                for j, (ename, eval_fn) in enumerate(_task_seq4):
+                    eval_env = eval_fn()
+                    mean_r, _ = evaluate_policy(
+                        model, eval_env, n_eval_episodes=_N_EVAL_EPS, deterministic=False)
+                    matrix[i, j] = float(mean_r)
+                    eval_env.close()
 
-    exp4_results = {}
-    for _cond4 in ("scratch", "plastic", "frozen"):
-        print(f"\n=== Exp 4: condition = {_cond4} ===")
-        exp4_results[_cond4] = _run_condition4(_cond4)
+            return matrix.tolist()
 
-    exp4_meta = {"task_names": [n for n, _ in _task_seq4]}
-    save_json(f"{RESULTS_DIR}/exp4/results.json", exp4_results)
-    save_json(f"{RESULTS_DIR}/exp4/meta.json", exp4_meta)
-    print("\nExp 4 complete.")
+        exp4_results = {}
+        for _cond4 in ("scratch", "plastic", "frozen"):
+            print(f"\n=== Exp 4: condition = {_cond4} ===")
+            exp4_results[_cond4] = _run_condition4(_cond4)
+
+        exp4_meta = {"task_names": [n for n, _ in _task_seq4]}
+        save_json(_results_path, exp4_results)
+        save_json(_meta_path, exp4_meta)
+        print("\nExp 4 complete.")
     return
 
 
@@ -887,73 +954,93 @@ def _(mo):
 def _(
     BASE_PPO,
     Monitor,
+    PPO,
     RESULTS_DIR,
     compute_aulc,
     freeze_encoder,
+    load_json,
     make_obstacle_env,
     make_ppo,
+    os,
     save_json,
     train_with_curve,
     transfer_all_policy,
     transfer_encoder,
 ):
-    _STEPS_A      = 100_000
-    _STEPS_B      = 100_000
-    _STEPS_C      = 100_000
-    _EVAL_FREQ    = 5_000
-    _N_EVAL_EPS   = 10
+    _curves_path = f"{RESULTS_DIR}/exp5/curves.json"
+    _aulc_path = f"{RESULTS_DIR}/exp5/aulc.json"
+    if os.path.exists(_curves_path) and os.path.exists(_aulc_path):
+        print("=== Exp 5: loading existing results ===")
+        exp5_curves = load_json(_curves_path)
+        exp5_aulc = load_json(_aulc_path)
+    else:
+        _STEPS_A      = 100_000
+        _STEPS_B      = 100_000
+        _STEPS_C      = 100_000
+        _EVAL_FREQ    = 5_000
+        _N_EVAL_EPS   = 10
 
-    _fn_A = lambda: Monitor(make_obstacle_env([]))
-    _fn_B = lambda: Monitor(make_obstacle_env([(2, 2)]))
-    _fn_C = lambda: Monitor(make_obstacle_env([(3, 2)]))
+        _fn_A = lambda: Monitor(make_obstacle_env([]))
+        _fn_B = lambda: Monitor(make_obstacle_env([(2, 2)]))
+        _fn_C = lambda: Monitor(make_obstacle_env([(3, 2)]))
 
-    print("=== Exp 5 ===")
+        print("=== Exp 5 ===")
 
-    # ── Train Task A (shared across conditions) ───────────────────────────────
-    print("Training Task A...")
-    _env_A = _fn_A()
-    exp5_model_A = make_ppo(_env_A, BASE_PPO)
-    exp5_model_A.learn(_STEPS_A)
-    exp5_model_A.save(f"{RESULTS_DIR}/exp5/model_A")
+        # ── Train Task A (shared across conditions) ───────────────────────────
+        _model_A_path = f"{RESULTS_DIR}/exp5/model_A.zip"
+        if os.path.exists(_model_A_path):
+            print("  Loading existing model A")
+            exp5_model_A = PPO.load(_model_A_path, env=_fn_A())
+        else:
+            print("Training Task A...")
+            _env_A = _fn_A()
+            exp5_model_A = make_ppo(_env_A, BASE_PPO)
+            exp5_model_A.learn(_STEPS_A)
+            exp5_model_A.save(f"{RESULTS_DIR}/exp5/model_A")
 
-    # ── Continue on Task B (plastic encoder) ─────────────────────────────────
-    print("Training Task B (continuing from A)...")
-    _env_B = _fn_B()
-    exp5_model_AB = make_ppo(_env_B, BASE_PPO)
-    transfer_all_policy(exp5_model_A, exp5_model_AB)
-    exp5_model_AB.learn(_STEPS_B, reset_num_timesteps=False)
-    exp5_model_AB.save(f"{RESULTS_DIR}/exp5/model_AB")
+        # ── Continue on Task B (plastic encoder) ──────────────────────────────
+        _model_AB_path = f"{RESULTS_DIR}/exp5/model_AB.zip"
+        if os.path.exists(_model_AB_path):
+            print("  Loading existing model AB")
+            exp5_model_AB = PPO.load(_model_AB_path, env=_fn_B())
+        else:
+            print("Training Task B (continuing from A)...")
+            _env_B = _fn_B()
+            exp5_model_AB = make_ppo(_env_B, BASE_PPO)
+            transfer_all_policy(exp5_model_A, exp5_model_AB)
+            exp5_model_AB.learn(_STEPS_B, reset_num_timesteps=False)
+            exp5_model_AB.save(f"{RESULTS_DIR}/exp5/model_AB")
 
-    exp5_curves = {}
+        exp5_curves = {}
 
-    # ── Condition 1: frozen_from_A ────────────────────────────────────────────
-    print("Task C – frozen_from_A...")
-    _m = make_ppo(_fn_C(), BASE_PPO)
-    transfer_encoder(exp5_model_A, _m)
-    freeze_encoder(_m)
-    exp5_curves["frozen_from_A"] = train_with_curve(
-        _m, _STEPS_C, _fn_C, _EVAL_FREQ, _N_EVAL_EPS)
+        # ── Condition 1: frozen_from_A ────────────────────────────────────────
+        print("Task C – frozen_from_A...")
+        _m = make_ppo(_fn_C(), BASE_PPO)
+        transfer_encoder(exp5_model_A, _m)
+        freeze_encoder(_m)
+        exp5_curves["frozen_from_A"] = train_with_curve(
+            _m, _STEPS_C, _fn_C, _EVAL_FREQ, _N_EVAL_EPS)
 
-    # ── Condition 2: updated_on_B ─────────────────────────────────────────────
-    print("Task C – updated_on_B...")
-    _m = make_ppo(_fn_C(), BASE_PPO)
-    transfer_encoder(exp5_model_AB, _m)
-    freeze_encoder(_m)
-    exp5_curves["updated_on_B"] = train_with_curve(
-        _m, _STEPS_C, _fn_C, _EVAL_FREQ, _N_EVAL_EPS)
+        # ── Condition 2: updated_on_B ─────────────────────────────────────────
+        print("Task C – updated_on_B...")
+        _m = make_ppo(_fn_C(), BASE_PPO)
+        transfer_encoder(exp5_model_AB, _m)
+        freeze_encoder(_m)
+        exp5_curves["updated_on_B"] = train_with_curve(
+            _m, _STEPS_C, _fn_C, _EVAL_FREQ, _N_EVAL_EPS)
 
-    # ── Condition 3: scratch_C ────────────────────────────────────────────────
-    print("Task C – scratch_C...")
-    _m = make_ppo(_fn_C(), BASE_PPO)
-    exp5_curves["scratch_C"] = train_with_curve(
-        _m, _STEPS_C, _fn_C, _EVAL_FREQ, _N_EVAL_EPS)
+        # ── Condition 3: scratch_C ────────────────────────────────────────────
+        print("Task C – scratch_C...")
+        _m = make_ppo(_fn_C(), BASE_PPO)
+        exp5_curves["scratch_C"] = train_with_curve(
+            _m, _STEPS_C, _fn_C, _EVAL_FREQ, _N_EVAL_EPS)
 
-    exp5_aulc = {cond: compute_aulc(curve) for cond, curve in exp5_curves.items()}
-    print(f"AULC: {exp5_aulc}")
+        exp5_aulc = {cond: compute_aulc(curve) for cond, curve in exp5_curves.items()}
+        print(f"AULC: {exp5_aulc}")
 
-    save_json(f"{RESULTS_DIR}/exp5/curves.json", exp5_curves)
-    save_json(f"{RESULTS_DIR}/exp5/aulc.json", exp5_aulc)
-    print("Exp 5 complete.")
+        save_json(_curves_path, exp5_curves)
+        save_json(_aulc_path, exp5_aulc)
+        print("Exp 5 complete.")
     return
 
 
